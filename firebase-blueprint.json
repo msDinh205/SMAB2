@@ -1,0 +1,39 @@
+{
+  "entities": {
+    "WeeklyData": {
+      "title": "Weekly Data",
+      "description": "Full weekly emulation data for a class",
+      "type": "object",
+      "properties": {
+        "className": { "type": "string" },
+        "week": { "type": "number" },
+        "dailyRecords": { "type": "array", "items": { "type": "object" } },
+        "weekendViolations": { "type": "object" },
+        "goodGradesCount": { "type": "number" },
+        "classLogScore": { "type": "number" },
+        "roomCount": { "type": "number" },
+        "studentCount": { "type": "number" },
+        "aiAnalysis": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "rejectionReason": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "lastUpdated": { "type": "string", "format": "date-time" }
+      },
+      "required": ["className", "week", "dailyRecords", "studentCount"]
+    }
+  },
+  "firestore": {
+    "pending_data/{docId}": {
+      "schema": { "$ref": "#/entities/WeeklyData" },
+      "description": "Submissions from students waiting for approval"
+    },
+    "official_data/{docId}": {
+      "schema": { "$ref": "#/entities/WeeklyData" },
+      "description": "Approved official records"
+    },
+    "drafts/{docId}": {
+      "schema": { "$ref": "#/entities/WeeklyData" },
+      "description": "Auto-saved drafts for students and teachers"
+    }
+  }
+}

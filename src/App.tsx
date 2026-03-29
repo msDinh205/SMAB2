@@ -1,0 +1,1834 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useMemo, useEffect, useRef } from 'react';
+import { 
+  Calculator, 
+  ClipboardList, 
+  FileText, 
+  Plus, 
+  Trash2, 
+  AlertCircle, 
+  CheckCircle2, 
+  TrendingUp,
+  MessageSquare,
+  Sparkles,
+  RefreshCw,
+  Download,
+  Camera,
+  Upload,
+  X,
+  Check
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { GoogleGenAI } from "@google/genai";
+import ReactMarkdown from 'react-markdown';
+import { toJpeg } from 'html-to-image';
+import { jsPDF } from 'jspdf';
+import { cn } from './lib/utils';
+import { db } from './firebase';
+import { getDocFromServer, doc, addDoc, collection, query, where, onSnapshot, updateDoc, setDoc, getDoc, deleteDoc } from 'firebase/firestore';
+import { 
+  WeeklyData, 
+  DailyRecord, 
+  Violation, 
+  VIOLATION_POINTS, 
+  VIOLATION_LABELS,
+  CLASSES,
+  ClassName,
+  EDUCATIONAL_SOLUTIONS
+} from './types';
+
+declare global {
+  interface Window {
+    aistudio?: {
+      hasSelectedApiKey: () => Promise<boolean>;
+      openSelectKey: () => Promise<void>;
+    };
+  }
+}
+
+const DAYS = ['Thứ 6', 'Thứ 2', 'Thứ 3', 'Thứ 4', 'Thứ 5'];
+
+const getInitialData = (): WeeklyData => ({
+  dailyRecords: DAYS.map(day => ({ day, violations: [], baseScore: 10, studentCount: 0 })),
+  weekendViolations: { saturday: false, sunday: false },
+  goodGradesCount: 0,
+  classLogScore: 10,
+  roomCount: 1,
+  studentCount: 0,
+});
+
+const calculateResultsForData = (data: WeeklyData) => {
+  if (!data) return { N: 0, T: 0, weekendDeduction: 0, S: 0, dailyScores: [0,0,0,0,0] };
+  const roomCount = Math.max(1, Number(data.roomCount) || 1);
+
+  const dailyScores = data.dailyRecords.map(record => {
+    let roomDeduction = 0;
+    let otherDeduction = 0;
+    
+    record.violations.forEach(v => {
+      const count = Number(v.count) || 0;
+      const points = (VIOLATION_POINTS[v.type] || 0) * count;
+      if (v.type === 'room') {
+        roomDeduction += points;
+      } else {
+        otherDeduction += points;
+      }
+    });
+    
+    const effectiveRoomDeduction = roomDeduction / roomCount;
+    const totalDeduction = otherDeduction + effectiveRoomDeduction;
+    
+    const baseScore = Number(record.baseScore) || 0;
+    const score = Math.max(0, baseScore - totalDeduction);
+    return Math.round(score * 100) / 100;
+  });
+  
+  const rawN = dailyScores.reduce((sum, s) => sum + s, 0) / 5;
+  const N = Math.round(rawN * 100) / 100;
+
+  let T = 0;
+  const g = Number(data.goodGradesCount) || 0;
+  if (g >= 1 && g <= 5) T = 2;
+  else if (g >= 6 && g <= 10) T = 4;
+  else if (g >= 11 && g <= 15) T = 6;
+  else if (g >= 16 && g <= 20) T = 8;
+  else if (g > 20) T = 10;
+
+  const weekendDeduction = (data.weekendViolations.saturday ? 2 : 0) + (data.weekendViolations.sunday ? 2 : 0);
+  const classLogScore = Number(data.classLogScore) || 0;
+  const rawS = (0.45 * N) + (0.45 * classLogScore) + (0.1 * T) - (weekendDeduction || 0);
+  const S = Math.round(rawS * 100) / 100;
+
+  return { N, T, weekendDeduction, S, dailyScores };
+};
+
+const safeToFixed = (val: any, digits: number = 2) => {
+  const num = Number(val);
+  if (val === null || val === undefined || isNaN(num)) {
+    return (0).toFixed(digits);
+  }
+  return num.toFixed(digits);
+};
+
+export default function App() {
+  const [userRole, setUserRole] = useState<'none' | 'student' | 'teacher'>('none');
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  useEffect(() => {
+    const savedKey = localStorage.getItem('app_api_key');
+    const savedRole = localStorage.getItem('app_user_role');
+    
+    if (savedKey === 'admin123') {
+      setUserRole('teacher');
+    } else if (savedRole === 'student') {
+      setUserRole('student');
+    }
+    setIsAuthReady(true);
+  }, []);
+
+  const handleLogin = () => {
+    if (apiKeyInput === 'admin123') {
+      setUserRole('teacher');
+      localStorage.setItem('app_api_key', 'admin123');
+    } else if (apiKeyInput === '') {
+      setUserRole('student');
+      localStorage.setItem('app_user_role', 'student');
+    } else {
+      alert('Mã giáo viên không hợp lệ! Để trống nếu là học sinh.');
+    }
+  };
+
+  const handleLogout = () => {
+    setUserRole('none');
+    setApiKeyInput('');
+    localStorage.removeItem('app_api_key');
+    localStorage.removeItem('app_user_role');
+  };
+
+  const [appData, setAppData] = useState<Record<ClassName, Record<number, WeeklyData>>>(() => {
+    const saved = localStorage.getItem('emulationAppData');
+    if (saved) {
+      try { return JSON.parse(saved); } catch (e) {}
+    }
+    return {} as Record<ClassName, Record<number, WeeklyData>>;
+  });
+
+  // Sync appData with Firestore (Official Records)
+  useEffect(() => {
+    if (!isAuthReady) return;
+    const q = query(collection(db, 'official_data'));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const newAppData: any = {};
+      snapshot.docs.forEach(doc => {
+        const [className, week] = doc.id.split('_');
+        if (!newAppData[className]) newAppData[className] = {};
+        newAppData[className][week] = doc.data();
+      });
+      setAppData(newAppData);
+      localStorage.setItem('emulationAppData', JSON.stringify(newAppData));
+    }, (error) => {
+      handleFirestoreError(error, 'list', 'official_data');
+    });
+    return unsubscribe;
+  }, [isAuthReady]);
+
+  const appDataRef = useRef(appData);
+  useEffect(() => {
+    appDataRef.current = appData;
+  }, [appData]);
+
+  const [selectedClass, setSelectedClass] = useState<ClassName>('6A');
+  const [selectedWeek, setSelectedWeek] = useState<number>(1);
+
+  const [data, setData] = useState<WeeklyData>(getInitialData());
+  const [rawInput, setRawInput] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [activeTab, setActiveTab] = useState<'input' | 'result' | 'ranking'>('input');
+  const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
+  const [showMarkdown, setShowMarkdown] = useState(false);
+  const [analyzingImageDay, setAnalyzingImageDay] = useState<number | null>(null);
+  const [analysisMethod, setAnalysisMethod] = useState<'camera' | 'upload' | null>(null);
+  const [pendingAiData, setPendingAiData] = useState<WeeklyData | null>(null);
+  const [showCheckModal, setShowCheckModal] = useState(false);
+  const [needsApiKey, setNeedsApiKey] = useState(false);
+
+  useEffect(() => {
+    const checkApiKey = async () => {
+      try {
+        if (window.aistudio && typeof window.aistudio.hasSelectedApiKey === 'function') {
+          const hasKey = await window.aistudio.hasSelectedApiKey();
+          if (!hasKey) {
+            setNeedsApiKey(true);
+          }
+        }
+      } catch (e) {
+        console.error("Error checking API key status:", e);
+      }
+    };
+    checkApiKey();
+  }, []);
+
+  const handleFirestoreError = (error: unknown, operationType: string, path: string | null) => {
+    const errInfo = {
+      error: error instanceof Error ? error.message : String(error),
+      operationType,
+      path
+    };
+    console.error('Firestore Error: ', JSON.stringify(errInfo));
+    throw new Error(JSON.stringify(errInfo));
+  };
+
+  const [pendingImageAnalysis, setPendingImageAnalysis] = useState<{ dayIndex: number, text: string, imageData: string } | null>(null);
+  const [isCameraActive, setIsCameraActive] = useState(false);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Reset analysis state if user cancels file picker
+  useEffect(() => {
+    const handleFocus = () => {
+      // Small delay to allow onChange to fire first if a file was selected
+      setTimeout(() => {
+        if (analyzingImageDay !== null) {
+          // If we're still in "analyzing" state but no file was processed (onChange didn't fire yet)
+          // we might want to reset, but it's risky if the AI is actually working.
+          // However, the AI work starts AFTER handleImageUpload, so if we are here and 
+          // handleImageUpload hasn't cleared the state, it means the picker was likely cancelled.
+          // We only reset if the inputs are empty.
+          if ((!fileInputRef.current?.files?.length)) {
+            setAnalyzingImageDay(null);
+            setAnalysisMethod(null);
+          }
+        }
+      }, 1000);
+    };
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
+  }, [analyzingImageDay]);
+
+  const rankingData = useMemo(() => {
+    const scores: { name: ClassName, score: number, level: 'THCS' | 'THPT' }[] = [];
+    
+    CLASSES.forEach(className => {
+      const classData = appData[className];
+      if (classData) {
+        const data = classData[selectedWeek];
+        if (data) {
+          const { S } = calculateResultsForData(data);
+          const level = (className.startsWith('10') || className.startsWith('11') || className.startsWith('12')) ? 'THPT' : 'THCS';
+          scores.push({ name: className, score: S, level });
+        }
+      }
+    });
+
+    const thcs = scores.filter(s => s.level === 'THCS').sort((a, b) => b.score - a.score);
+    const thpt = scores.filter(s => s.level === 'THPT').sort((a, b) => b.score - a.score);
+    
+    const bottomThcs = [...thcs].reverse().slice(0, 3);
+    const bottomThpt = [...thpt].reverse().slice(0, 2);
+    
+    return { thcs, thpt, bottomThcs, bottomThpt };
+  }, [appData, selectedWeek]);
+
+  const contentRef = useRef<HTMLDivElement>(null);
+    const handlePrint = async () => {
+    if (!contentRef.current) return;
+    
+    const element = contentRef.current;
+    const buttons = element.querySelectorAll('.print\\:hidden');
+    buttons.forEach((btn) => (btn as HTMLElement).style.display = 'none');
+
+    try {
+      const dataUrl = await toJpeg(element, { 
+        quality: 0.95, 
+        backgroundColor: '#E4E3E0',
+        pixelRatio: 2
+      });
+      
+      const pdf = new jsPDF({
+        orientation: 'portrait',
+        unit: 'mm',
+        format: 'a4'
+      });
+
+      const imgProps = pdf.getImageProperties(dataUrl);
+      const pdfWidth = pdf.internal.pageSize.getWidth();
+      const pdfHeight = (imgProps.height * pdfWidth) / imgProps.width;
+      
+      pdf.addImage(dataUrl, 'JPEG', 0, 0, pdfWidth, pdfHeight);
+      pdf.save(`Bao_cao_noi_tru_Tuan_${selectedWeek}_Lop_${selectedClass}.pdf`);
+    } catch (error) {
+      console.error('Lỗi khi tạo PDF:', error);
+      alert('Có lỗi xảy ra khi tạo file PDF.');
+    } finally {
+      buttons.forEach((btn) => (btn as HTMLElement).style.display = '');
+    }
+  };
+
+  // Auto-save current data to drafts
+  useEffect(() => {
+    if (!isAuthReady || userRole === 'none') return;
+    
+    const saveDraft = async () => {
+      const draftId = `${userRole}_${selectedClass}_${selectedWeek}`;
+      try {
+        await setDoc(doc(db, 'drafts', draftId), {
+          ...data,
+          className: selectedClass,
+          week: selectedWeek,
+          lastUpdated: new Date()
+        });
+      } catch (e) {
+        console.error("Error saving draft:", e);
+      }
+    };
+    
+    const timeout = setTimeout(saveDraft, 1000);
+    return () => clearTimeout(timeout);
+  }, [data, selectedClass, selectedWeek, userRole, isAuthReady]);
+
+  // Load data with priority: Official > Pending > Draft > Initial
+  useEffect(() => {
+    if (!isAuthReady || userRole === 'none') return;
+    
+    const loadData = async () => {
+      try {
+        // 1. Check Official Data (Approved)
+        const classData = appData[selectedClass] || {};
+        const official = classData[selectedWeek];
+        
+        if (official) {
+          setData(official as WeeklyData);
+          return;
+        }
+
+        // 2. Check Draft (Local unsaved changes)
+        const draftId = `${userRole}_${selectedClass}_${selectedWeek}`;
+        const snap = await getDoc(doc(db, 'drafts', draftId));
+        if (snap.exists()) {
+          setData(snap.data() as WeeklyData);
+        } else {
+          // 4. Initial Data
+          setData(getInitialData());
+        }
+      } catch (e) {
+        console.error("Error loading data:", e);
+      }
+    };
+    
+    loadData();
+  }, [selectedClass, selectedWeek, userRole, isAuthReady, appData]);
+
+  useEffect(() => {
+    const checkApiKey = async () => {
+      try {
+        if (window.aistudio && typeof window.aistudio.hasSelectedApiKey === 'function') {
+          const hasKey = await window.aistudio.hasSelectedApiKey();
+          if (!hasKey) {
+            const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+            if (!apiKey || apiKey === "undefined" || apiKey === "") {
+              setNeedsApiKey(true);
+            }
+          }
+        } else {
+          const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+          if (!apiKey || apiKey === "undefined" || apiKey === "") {
+            setNeedsApiKey(true);
+          }
+        }
+      } catch (e) {
+        console.error("Error checking API key:", e);
+      }
+    };
+    checkApiKey();
+  }, []);
+
+  const calculateResults = useMemo(() => calculateResultsForData(data), [data]);
+
+  const comparativeAnalysis = useMemo(() => {
+    const classData = appData[selectedClass] || {};
+    const w1Data = classData[selectedWeek - 1];
+    const w2Data = classData[selectedWeek - 2];
+
+    let growth = null;
+    let w1Score = null;
+    if (w1Data) {
+      const w1Results = calculateResultsForData(w1Data);
+      w1Score = w1Results.S;
+      if (w1Score > 0) {
+        growth = ((calculateResults.S - w1Score) / w1Score) * 100;
+      }
+    }
+
+    const weeksToAnalyze = [data, w1Data, w2Data].filter(Boolean) as WeeklyData[];
+    const last3WeeksScores = weeksToAnalyze.map(w => calculateResultsForData(w).S);
+    
+    const violationCounts: Record<string, number> = {};
+    
+    weeksToAnalyze.forEach(w => {
+      w.dailyRecords.forEach(r => {
+        r.violations.forEach(v => {
+          violationCounts[v.type] = (violationCounts[v.type] || 0) + v.count;
+        });
+      });
+    });
+
+    let mostFrequentViolationType = null;
+    let mostFrequentViolation = null;
+    let maxCount = 0;
+    Object.entries(violationCounts).forEach(([type, count]) => {
+      if (count > maxCount) {
+        maxCount = count;
+        mostFrequentViolationType = type;
+        mostFrequentViolation = VIOLATION_LABELS[type as keyof typeof VIOLATION_LABELS];
+      }
+    });
+
+    return { w1Score, growth, mostFrequentViolation, mostFrequentViolationType, maxCount, last3WeeksScores };
+  }, [appData, selectedClass, selectedWeek, data, calculateResults.S]);
+
+  const generateMarkdown = () => {
+    let md = `### Bảng Điểm Thi Đua Tuần ${selectedWeek} - Lớp ${selectedClass}\n\n`;
+    md += `| Hạng mục | Chi tiết | Điểm |\n`;
+    md += `| :--- | :--- | :--- |\n`;
+    
+    data.dailyRecords.forEach((r, i) => {
+      const details = r.violations.length > 0 
+        ? r.violations.map(v => {
+            let text = `${VIOLATION_LABELS[v.type]} x${v.count}`;
+            if (v.type === 'room' && (data.roomCount || 1) > 1) {
+              text += ` (chia ${data.roomCount} phòng)`;
+            }
+            return text;
+          }).join(', ')
+        : "Không vi phạm";
+      md += `| **${r.day}** | ${details} | ${safeToFixed(calculateResults.dailyScores[i], 2)} |\n`;
+    });
+
+    md += `| **Điểm nề nếp trung bình (N)** | (Tổng 5 ngày) / 5 | **${safeToFixed(calculateResults.N, 2)}** |\n`;
+    md += `| **Điểm Sổ đầu bài** | Dữ liệu từ giáo viên | ${safeToFixed(data.classLogScore, 1)} |\n`;
+    md += `| **Điểm thưởng (T)** | ${data.goodGradesCount} điểm 9, 10 | +${calculateResults.T} |\n`;
+    
+    let weekendStr = "Không vi phạm";
+    if (data.weekendViolations.saturday || data.weekendViolations.sunday) {
+      weekendStr = [
+        data.weekendViolations.saturday ? "Thứ 7 (-2)" : "",
+        data.weekendViolations.sunday ? "Chủ nhật (-2)" : ""
+      ].filter(Boolean).join(", ");
+    }
+    md += `| **Trừ cuối tuần** | ${weekendStr} | -${calculateResults.weekendDeduction} |\n`;
+    md += `| **TỔNG ĐIỂM (S)** | (0.45*N) + (0.45*SĐB) + (0.1*T) - L | **${safeToFixed(calculateResults.S, 2)}** |\n`;
+
+    return md;
+  };
+
+  const handleProcessRawData = async () => {
+    if (!rawInput.trim()) return;
+    setIsProcessing(true);
+    try {
+      const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+      if (!apiKey || apiKey === "undefined" || apiKey === "") {
+        setNeedsApiKey(true);
+        throw new Error("Hệ thống yêu cầu mã API để sử dụng tính năng AI. Vui lòng nhấn nút 'Chọn mã API' phía trên.");
+      }
+      const ai = new GoogleGenAI({ apiKey });
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: `
+          Bạn là trợ lý trích xuất dữ liệu thi đua. 
+          Dựa trên văn bản thô sau, hãy trích xuất các thông tin cần thiết để điền vào cấu trúc dữ liệu.
+          
+          Văn bản: "${rawInput}"
+          
+          Quy tắc trích xuất:
+          1. Tìm lỗi vi phạm cho 5 ngày: Thứ 6, Thứ 2, Thứ 3, Thứ 4, Thứ 5.
+          2. Các loại lỗi: classroom (lớp học/tự học), room (phòng ở), dining (bàn ăn), hygiene (vệ sinh -2), heavy5 (thuốc lá/đt), heavy10 (đánh bài/gây gổ).
+          3. Tìm số lượng điểm 9, 10 trong tuần.
+          4. Tìm điểm sổ đầu bài.
+          5. Tìm vi phạm Thứ 7, Chủ nhật.
+          
+          Trả về JSON theo định dạng sau:
+          {
+            "dailyRecords": [
+              { "day": "Thứ 6", "violations": [{ "type": "room", "description": "Phòng bẩn", "count": 1 }] },
+              ... (đủ 5 ngày theo thứ tự: Thứ 6, Thứ 2, Thứ 3, Thứ 4, Thứ 5)
+            ],
+            "weekendViolations": { "saturday": boolean, "sunday": boolean },
+            "goodGradesCount": number,
+            "classLogScore": number,
+            "roomCount": number (số lượng phòng nội trú của lớp, mặc định giữ nguyên nếu không nhắc đến)
+          }
+          
+          Lưu ý: Nếu ngày nào không có lỗi, mảng violations để trống. Điểm sổ đầu bài mặc định là 10 nếu không thấy nhắc tới.
+        `,
+        config: { responseMimeType: "application/json" }
+      });
+
+      const result = JSON.parse(response.text);
+      const parsedData = {
+        ...data,
+        ...result,
+        dailyRecords: result.dailyRecords.map((r: any) => ({ ...r, baseScore: 10 }))
+      };
+      setPendingAiData(parsedData);
+    } catch (error) {
+      console.error("Error processing data:", error);
+      alert("Có lỗi xảy ra khi xử lý dữ liệu. Vui lòng kiểm tra lại văn bản.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const confirmAiData = () => {
+    if (pendingAiData) {
+      setData(pendingAiData);
+      setPendingAiData(null);
+      setActiveTab('result');
+      generateAiAnalysis(pendingAiData);
+    }
+  };
+
+  const cancelAiData = () => {
+    setPendingAiData(null);
+  };
+
+  const generateAiAnalysis = async (currentData: WeeklyData) => {
+    try {
+      const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+      if (!apiKey || apiKey === "undefined" || apiKey === "") {
+        setNeedsApiKey(true);
+        throw new Error("Hệ thống yêu cầu mã API để sử dụng tính năng AI. Vui lòng nhấn nút 'Chọn mã API' phía trên.");
+      }
+      const ai = new GoogleGenAI({ apiKey });
+      setAiAnalysis(""); // Reset analysis
+      const responseStream = await ai.models.generateContentStream({
+        model: "gemini-3-flash-preview",
+        contents: `
+          Dựa trên dữ liệu thi đua sau, hãy đưa ra nhận xét ngắn gọn (khoảng 2-3 câu) về ưu điểm và nhược điểm của lớp trong tuần này.
+          Dữ liệu: ${JSON.stringify(currentData)}
+          Kết quả tính toán: N=${calculateResults.N}, T=${calculateResults.T}, S=${calculateResults.S}
+          Sĩ số lớp: ${currentData.studentCount}
+          Hãy đưa ra lời khuyên tư vấn tâm lý phù hợp cho những học sinh vi phạm dựa trên các lỗi vi phạm của lớp.
+          Ngôn ngữ: Tiếng Việt.
+        `
+      });
+      
+      let fullText = "";
+      for await (const chunk of responseStream) {
+        fullText += chunk.text;
+        setAiAnalysis(fullText);
+      }
+      // Update data state with the analysis so it's saved in appData
+      setData(prev => ({ ...prev, aiAnalysis: fullText }));
+    } catch (e) {
+      console.error("AI Analysis Error:", e);
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      setAiAnalysis(`Không thể tạo nhận xét từ AI. (Lỗi: ${errorMsg})`);
+    }
+  };
+
+  const addViolation = (dayIndex: number) => {
+    const newData = { ...data };
+    newData.dailyRecords[dayIndex].violations.push({
+      type: 'classroom',
+      description: '',
+      count: 1
+    });
+    setData(newData);
+  };
+
+  const removeViolation = (dayIndex: number, vIndex: number) => {
+    const newData = { ...data };
+    newData.dailyRecords[dayIndex].violations.splice(vIndex, 1);
+    setData(newData);
+  };
+
+  const updateViolation = (dayIndex: number, vIndex: number, field: keyof Violation, value: any) => {
+    const newData = { ...data };
+    (newData.dailyRecords[dayIndex].violations[vIndex] as any)[field] = value;
+    setData(newData);
+  };
+
+  const updateDailyRecord = (dayIndex: number, field: keyof DailyRecord, value: any) => {
+    const newData = { ...data };
+    (newData.dailyRecords[dayIndex] as any)[field] = value;
+    setData(newData);
+  };
+
+  const analyzeImage = async (base64Data: string, dayIndex: number) => {
+    try {
+      const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+      
+      if (!apiKey || apiKey === "undefined" || apiKey === "") {
+        setNeedsApiKey(true);
+        throw new Error("Hệ thống yêu cầu mã API để sử dụng tính năng AI. Vui lòng nhấn nút 'Chọn mã API' phía trên.");
+      }
+
+      const ai = new GoogleGenAI({ apiKey });
+      
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType: 'image/jpeg',
+                data: base64Data.split(',')[1]
+              }
+            },
+            {
+              text: `Bạn là giám thị kiểm tra nề nếp trường nội trú. Hãy phân tích bức ảnh này và liệt kê các lỗi vi phạm tìm thấy.
+              
+              Các loại lỗi hợp lệ:
+              - 'classroom': Lớp học/Tự học (ồn ào, không tập trung, v.v.)
+              - 'room': Phòng ở (chăn màn chưa gấp, đồ đạc lộn xộn, v.v.)
+              - 'dining': Bàn ăn (không dọn dẹp, lãng phí thức ăn, v.v.)
+              - 'hygiene': Vệ sinh (rác trên sàn, khu vực chung bẩn, v.v.)
+              - 'heavy5': Lỗi nặng (Sử dụng điện thoại, hút thuốc, v.v.)
+              - 'heavy10': Lỗi nặng (Đánh bài, gây gổ, v.v.)
+              
+              Yêu cầu:
+              1. Liệt kê các lỗi vi phạm tìm thấy trong ảnh.
+              2. Với mỗi lỗi, hãy xác định loại lỗi từ danh sách trên, mô tả chi tiết và số lượng học sinh/phòng vi phạm.
+              3. Trình bày kết quả dưới dạng Markdown ngắn gọn bằng tiếng Việt.`
+            }
+          ]
+        }
+      });
+      
+      if (!response.text) {
+        throw new Error("AI không trả về kết quả phân tích.");
+      }
+
+      setPendingImageAnalysis({ dayIndex, text: response.text, imageData: base64Data });
+    } catch (error) {
+      console.error("Lỗi phân tích ảnh:", error);
+      let errorMessage = "Có lỗi xảy ra khi phân tích ảnh.";
+      if (error instanceof Error) {
+        errorMessage = error.message;
+      } else if (typeof error === 'string') {
+        errorMessage = error;
+      } else if (error && typeof error === 'object') {
+        errorMessage = (error as any).message || JSON.stringify(error);
+      }
+      
+      if (errorMessage.includes("API key not valid") || errorMessage.includes("400") || errorMessage.includes("INVALID_ARGUMENT") || errorMessage.includes("API_KEY_INVALID")) {
+        setNeedsApiKey(true);
+        errorMessage = "Mã API không hợp lệ hoặc đã hết hạn. Vui lòng nhấn nút 'Chọn mã API' màu đỏ xuất hiện phía trên để tiếp tục.";
+      }
+      
+      alert(errorMessage);
+    } finally {
+      setAnalyzingImageDay(null);
+      setAnalysisMethod(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || analyzingImageDay === null) return;
+
+    if (file.size > 15 * 1024 * 1024) {
+      alert("Ảnh quá lớn (tối đa 15MB). Vui lòng chọn ảnh khác hoặc giảm dung lượng ảnh.");
+      setAnalyzingImageDay(null);
+      setAnalysisMethod(null);
+      return;
+    }
+
+    try {
+      const compressImage = (file: File): Promise<string> => {
+        return new Promise((resolve, reject) => {
+          const img = new Image();
+          const objectUrl = URL.createObjectURL(file);
+          const timeout = setTimeout(() => {
+            URL.revokeObjectURL(objectUrl);
+            reject(new Error("Quá thời gian tải ảnh."));
+          }, 15000);
+
+          img.onload = () => {
+            clearTimeout(timeout);
+            URL.revokeObjectURL(objectUrl);
+            const canvas = document.createElement('canvas');
+            const MAX_WIDTH = 1024;
+            const MAX_HEIGHT = 1024;
+            let width = img.width;
+            let height = img.height;
+            if (width > height) {
+              if (width > MAX_WIDTH) { height *= MAX_WIDTH / width; width = MAX_WIDTH; }
+            } else {
+              if (height > MAX_HEIGHT) { width *= MAX_HEIGHT / height; height = MAX_HEIGHT; }
+            }
+            canvas.width = width; canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            ctx?.drawImage(img, 0, 0, width, height);
+            resolve(canvas.toDataURL('image/jpeg', 0.7));
+          };
+          img.onerror = () => { clearTimeout(timeout); URL.revokeObjectURL(objectUrl); reject(new Error("Lỗi tải ảnh.")); };
+          img.src = objectUrl;
+        });
+      };
+
+      const base64Data = await compressImage(file);
+      await analyzeImage(base64Data, analyzingImageDay);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Lỗi xử lý ảnh");
+      setAnalyzingImageDay(null);
+      setAnalysisMethod(null);
+    }
+  };
+
+  const startCamera = async (dayIndex: number) => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: { facingMode: 'environment' } 
+      });
+      setCameraStream(stream);
+      setIsCameraActive(true);
+      setAnalyzingImageDay(dayIndex);
+      setAnalysisMethod('camera');
+      // We'll use a ref for the video element in the modal
+    } catch (err) {
+      console.error("Error accessing camera:", err);
+      alert("Không thể truy cập camera. Vui lòng kiểm tra quyền truy cập.");
+    }
+  };
+
+  useEffect(() => {
+    if (isCameraActive && cameraStream && videoRef.current) {
+      videoRef.current.srcObject = cameraStream;
+    }
+  }, [isCameraActive, cameraStream]);
+
+  const stopCamera = () => {
+    if (cameraStream) {
+      cameraStream.getTracks().forEach(track => track.stop());
+    }
+    setCameraStream(null);
+    setIsCameraActive(false);
+    setAnalyzingImageDay(null);
+    setAnalysisMethod(null);
+  };
+
+  const capturePhoto = () => {
+    if (!videoRef.current || analyzingImageDay === null) return;
+    
+    const canvas = document.createElement('canvas');
+    canvas.width = videoRef.current.videoWidth;
+    canvas.height = videoRef.current.videoHeight;
+    const ctx = canvas.getContext('2d');
+    ctx?.drawImage(videoRef.current, 0, 0);
+    
+    const base64Data = canvas.toDataURL('image/jpeg', 0.8);
+    const dayIdx = analyzingImageDay;
+    stopCamera();
+    setAnalyzingImageDay(dayIdx); // Re-set for analysis
+    setAnalysisMethod('camera');
+    analyzeImage(base64Data, dayIdx);
+  };
+
+  const confirmImageAnalysis = () => {
+    setPendingImageAnalysis(null);
+  };
+
+  if (!isAuthReady) {
+    return (
+      <div className="min-h-screen bg-[#E4E3E0] flex items-center justify-center font-sans">
+        <div className="animate-pulse flex flex-col items-center gap-4">
+          <div className="w-12 h-12 border-4 border-green-700 border-t-transparent rounded-full animate-spin"></div>
+          <p className="text-sm font-mono opacity-50">Đang tải hệ thống...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (userRole === 'none') {
+    return (
+      <div className="min-h-screen bg-green-900 flex items-center justify-center font-sans p-4">
+        <div className="bg-white p-8 rounded-xl shadow-2xl max-w-md w-full text-center">
+          <div className="w-16 h-16 bg-green-100 text-green-700 rounded-full flex items-center justify-center mx-auto mb-6">
+            <Sparkles size={32} />
+          </div>
+          <h1 className="text-3xl font-serif italic font-bold tracking-tight text-gray-900 mb-2">Smart Boarding 4.0</h1>
+          <p className="text-sm uppercase tracking-widest text-gray-500 font-mono mb-8">Giải pháp Số hóa Nề nếp và Học tập</p>
+          
+          <div className="space-y-4">
+            <input 
+              type="password" 
+              value={apiKeyInput}
+              onChange={(e) => setApiKeyInput(e.target.value)}
+              placeholder="Mã giáo viên (để trống nếu là HS)..."
+              className="w-full px-4 py-3 rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-green-500 font-mono text-center"
+            />
+            <button 
+              onClick={handleLogin}
+              className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-lg transition-colors shadow-lg shadow-green-900/20"
+            >
+              Đăng nhập
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-[#E4E3E0] text-[#141414] font-sans selection:bg-[#141414] selection:text-[#E4E3E0] print:bg-white">
+      {/* Header */}
+      <header className="p-6 flex flex-col md:flex-row justify-between items-start md:items-center bg-green-700 text-white sticky top-0 z-20 gap-4 print:hidden shadow-xl border-b-4 border-green-900">
+        <div>
+          <h1 className="text-2xl font-serif italic font-bold tracking-tight text-white flex items-center gap-3">
+            Smart Boarding
+            <span className="bg-green-900 text-green-100 px-2 py-0.5 rounded-sm text-sm not-italic font-mono uppercase tracking-widest shadow-lg shadow-green-900/50">v4.0</span>
+          </h1>
+          <p className="text-[11px] uppercase tracking-widest text-green-100 font-mono mt-1">Giải pháp Số hóa Nề nếp và Học tập</p>
+        </div>
+        
+        <div className="flex flex-wrap items-center gap-4">
+          <div className="flex items-center gap-2">
+            <select 
+              value={selectedClass}
+              onChange={(e) => setSelectedClass(e.target.value as ClassName)}
+              className="px-3 py-2 text-sm font-mono border border-green-600 bg-green-800 text-white focus:outline-none focus:border-green-400 transition-colors rounded-sm"
+            >
+              {CLASSES.map(c => <option key={c} value={c}>Lớp {c}</option>)}
+            </select>
+            
+            <select 
+              value={selectedWeek}
+              onChange={(e) => setSelectedWeek(parseInt(e.target.value))}
+              className="px-3 py-2 text-sm font-mono border border-green-600 bg-green-800 text-white focus:outline-none focus:border-green-400 transition-colors rounded-sm"
+            >
+              {Array.from({length: 35}, (_, i) => i + 1).map(w => <option key={w} value={w}>Tuần {w}</option>)}
+            </select>
+            
+            <div className="flex items-center gap-2 border border-green-600 bg-green-800 px-3 py-2 transition-colors focus-within:border-green-400 rounded-sm" title="Số lượng phòng nội trú của lớp này">
+              <span className="text-sm font-mono text-green-200/70">Số phòng:</span>
+              <input 
+                type="number" 
+                min="1" 
+                value={data.roomCount || 1}
+                onChange={(e) => setData({...data, roomCount: Math.max(1, parseInt(e.target.value) || 1)})}
+                className="w-12 text-sm font-mono bg-transparent text-white focus:outline-none text-center"
+              />
+            </div>
+            <div className="flex items-center gap-2 border border-green-600 bg-green-800 px-3 py-2 transition-colors focus-within:border-green-400 rounded-sm" title="Sĩ số học sinh">
+              <span className="text-sm font-mono text-green-200/70">Sĩ số:</span>
+              <input 
+                type="number" 
+                min="0" 
+                value={data.studentCount || 0}
+                onChange={(e) => setData({...data, studentCount: parseInt(e.target.value) || 0})}
+                className="w-12 text-sm font-mono bg-transparent text-white focus:outline-none text-center"
+              />
+            </div>
+          </div>
+
+          <div className="flex gap-2 bg-green-800 p-1 border border-green-600 rounded-sm">
+            <button 
+              onClick={() => setActiveTab('input')}
+              className={cn(
+                "px-4 py-1.5 text-xs font-mono uppercase tracking-tighter transition-all rounded-sm",
+                activeTab === 'input' ? "bg-green-600 text-white font-bold shadow-md" : "text-green-200/70 hover:text-white hover:bg-green-700"
+              )}
+            >
+              Nhập liệu
+            </button>
+            <button 
+              onClick={() => setActiveTab('result')}
+              className={cn(
+                "px-4 py-1.5 text-xs font-mono uppercase tracking-tighter transition-all rounded-sm",
+                activeTab === 'result' ? "bg-green-600 text-white font-bold shadow-md" : "text-green-200/70 hover:text-white hover:bg-green-700"
+              )}
+            >
+              Kết quả
+            </button>
+            <button 
+              onClick={() => setActiveTab('ranking')}
+              className={cn(
+                "px-4 py-1.5 text-xs font-mono uppercase tracking-tighter transition-all rounded-sm",
+                activeTab === 'ranking' ? "bg-green-600 text-white font-bold shadow-md" : "text-green-200/70 hover:text-white hover:bg-green-700"
+              )}
+            >
+              Bảng xếp hạng
+            </button>
+          </div>
+          
+          <div className="flex items-center gap-3 ml-2 pl-4 border-l border-green-600">
+            <div className="hidden md:block text-right">
+              <p className="text-xs font-bold text-white leading-tight">Giáo viên</p>
+              <p className="text-[10px] text-green-200 font-mono">Đã xác thực</p>
+            </div>
+            <div className="w-8 h-8 rounded-full bg-green-800 border border-green-400 flex items-center justify-center text-xs font-bold">
+              GV
+            </div>
+            <button 
+              onClick={handleLogout}
+              className="text-green-200 hover:text-white transition-colors p-1"
+              title="Đăng xuất"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-6xl mx-auto p-6">
+            {needsApiKey && (
+              <div className="max-w-4xl mx-auto mb-6 bg-red-50 border-2 border-red-200 p-4 rounded-lg flex flex-col md:flex-row items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <AlertCircle className="w-6 h-6 text-red-600" />
+                  <div>
+                    <p className="text-red-800 font-bold text-sm">Yêu cầu mã API</p>
+                    <p className="text-red-600 text-xs">Tính năng AI yêu cầu mã API cá nhân để hoạt động trong môi trường chia sẻ.</p>
+                  </div>
+                </div>
+                <button 
+                  onClick={async () => {
+                    try {
+                      if (window.aistudio && typeof window.aistudio.openSelectKey === 'function') {
+                        await window.aistudio.openSelectKey();
+                        setNeedsApiKey(false);
+                        // We assume success and reload to apply the new key
+                        window.location.reload();
+                      } else {
+                        alert("Tính năng chọn mã API không khả dụng trong trình duyệt này. Vui lòng thử lại sau.");
+                      }
+                    } catch (e) {
+                      console.error("Error opening API key selection:", e);
+                      alert("Không thể mở hộp thoại chọn mã API.");
+                    }
+                  }}
+                  className="bg-red-600 hover:bg-red-700 text-white px-6 py-2 rounded-md font-bold text-sm transition-colors shadow-lg"
+                >
+                  Chọn mã API
+                </button>
+              </div>
+            )}
+        <AnimatePresence mode="wait">
+          {activeTab === 'input' ? (
+            <motion.div 
+              key="input"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              className="space-y-8"
+            >
+              {/* Quick Input Section */}
+              <section className="bg-white border border-[#141414] p-6 shadow-[4px_4px_0px_0px_rgba(20,20,20,1)]">
+                <div className="flex items-center gap-2 mb-4">
+                  <Sparkles className="w-4 h-4" />
+                  <h2 className="font-serif italic text-lg">Nhập nhanh bằng văn bản</h2>
+                </div>
+                <textarea 
+                  value={rawInput}
+                  onChange={(e) => setRawInput(e.target.value)}
+                  placeholder="Ví dụ: Thứ 6 lớp sạch nhưng phòng 201 bẩn (-2), Thứ 2 có 1 bạn hút thuốc (-5). Tuần này có 15 điểm 10. Sổ đầu bài 9.5..."
+                  className="w-full h-32 p-4 bg-[#F5F5F3] border border-[#141414] focus:outline-none focus:ring-1 focus:ring-[#141414] font-mono text-sm resize-none"
+                />
+                <button 
+                  onClick={handleProcessRawData}
+                  disabled={isProcessing || !rawInput.trim()}
+                  className="mt-4 w-full py-3 bg-[#141414] text-[#E4E3E0] font-mono text-xs uppercase tracking-widest flex items-center justify-center gap-2 hover:bg-[#333] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {isProcessing ? <RefreshCw className="w-4 h-4 animate-spin" /> : <TrendingUp className="w-4 h-4" />}
+                  {isProcessing ? "Đang xử lý..." : "AI Gợi ý Dữ liệu"}
+                </button>
+              </section>
+
+              {/* AI Suggestion Review Panel */}
+              <AnimatePresence>
+                {pendingAiData && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -20 }}
+                    className="bg-yellow-50 border-2 border-yellow-400 p-6 mb-8 relative"
+                  >
+                    <div className="absolute top-0 right-0 bg-yellow-400 text-yellow-900 text-[10px] font-bold px-2 py-1 uppercase tracking-widest">
+                      AI Gợi ý
+                    </div>
+                    <h3 className="font-serif italic text-lg text-yellow-900 mb-4 flex items-center gap-2">
+                      <Sparkles className="w-5 h-5" />
+                      Vui lòng kiểm tra dữ liệu AI trích xuất
+                    </h3>
+                    
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6 text-sm font-mono">
+                      <div>
+                        <p className="font-bold text-yellow-800">Điểm Sổ Đầu Bài: <span className="font-normal text-black">{pendingAiData.classLogScore}</span></p>
+                        <p className="font-bold text-yellow-800">Điểm 9, 10: <span className="font-normal text-black">{pendingAiData.goodGradesCount}</span></p>
+                        <p className="font-bold text-yellow-800">Vi phạm T7/CN: <span className="font-normal text-black">{pendingAiData.weekendViolations.saturday ? 'Thứ 7' : ''} {pendingAiData.weekendViolations.sunday ? 'Chủ nhật' : ''} {!pendingAiData.weekendViolations.saturday && !pendingAiData.weekendViolations.sunday ? 'Không' : ''}</span></p>
+                      </div>
+                      <div>
+                        <p className="font-bold text-yellow-800 mb-1">Vi phạm trong tuần:</p>
+                        <ul className="list-disc pl-4 text-black text-xs space-y-1">
+                          {pendingAiData.dailyRecords.map(r => 
+                            r.violations.length > 0 ? (
+                              <li key={r.day}>
+                                <strong>{r.day}:</strong> {r.violations.map(v => `${VIOLATION_LABELS[v.type]} (x${v.count})`).join(', ')}
+                              </li>
+                            ) : null
+                          )}
+                          {pendingAiData.dailyRecords.every(r => r.violations.length === 0) && (
+                            <li className="italic opacity-50">Không có vi phạm nào được tìm thấy.</li>
+                          )}
+                        </ul>
+                      </div>
+                    </div>
+
+                    <div className="flex gap-3">
+                      <button 
+                        onClick={confirmAiData}
+                        className="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 transition-colors flex items-center justify-center gap-2 text-sm"
+                      >
+                        <CheckCircle2 className="w-4 h-4" />
+                        Xác nhận & Áp dụng
+                      </button>
+                      <button 
+                        onClick={cancelAiData}
+                        className="flex-1 bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 font-bold py-2 px-4 transition-colors text-sm"
+                      >
+                        Hủy bỏ
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* Image Analysis Suggestion Panel */}
+              <AnimatePresence>
+                {pendingImageAnalysis && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -20 }}
+                    className="bg-blue-50 border-2 border-blue-400 p-6 mb-8 relative"
+                  >
+                    <div className="absolute top-0 right-0 bg-blue-400 text-blue-900 text-[10px] font-bold px-2 py-1 uppercase tracking-widest">
+                      AI Phân tích ảnh
+                    </div>
+                    <h3 className="font-serif italic text-lg text-blue-900 mb-2 flex items-center gap-2">
+                      <Camera className="w-5 h-5" />
+                      Kết quả nhận diện ({data.dailyRecords[pendingImageAnalysis.dayIndex].day})
+                    </h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-4">
+                      <div className="bg-white p-2 border border-blue-200 shadow-sm">
+                        <img 
+                          src={pendingImageAnalysis.imageData} 
+                          alt="Ảnh phân tích" 
+                          className="w-full h-auto object-contain max-h-[300px]"
+                          referrerPolicy="no-referrer"
+                        />
+                      </div>
+                      <div className="bg-white p-4 border border-blue-200 text-sm">
+                        <div className="prose prose-sm max-w-none prose-blue">
+                          <ReactMarkdown>
+                            {pendingImageAnalysis.text}
+                          </ReactMarkdown>
+                        </div>
+                      </div>
+                    </div>
+                    <p className="text-xs text-blue-700 mb-4 italic">
+                      * Hãy đọc kết quả trên và tự thêm lỗi vi phạm tương ứng vào danh sách bên dưới nếu bạn đồng ý.
+                    </p>
+                    <button 
+                      onClick={confirmImageAnalysis}
+                      className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 transition-colors flex items-center justify-center gap-2 text-sm"
+                    >
+                      <CheckCircle2 className="w-4 h-4" />
+                      Đã hiểu & Đóng
+                    </button>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                {/* Manual Input - Daily Records */}
+                <div className="lg:col-span-2 space-y-6">
+                  <div className="flex items-center gap-2 mb-2">
+                    <ClipboardList className="w-4 h-4" />
+                    <h2 className="font-serif italic text-lg">Chi tiết nề nếp (Thứ 6 - Thứ 5)</h2>
+                  </div>
+                  
+                  {data.dailyRecords.map((record, dIdx) => (
+                    <div key={record.day} className="bg-white border border-[#141414] overflow-hidden">
+                      <div className="bg-[#141414] text-[#E4E3E0] px-4 py-2 flex justify-between items-center">
+                        <div className="flex items-center gap-4">
+                          <span className="font-mono text-xs uppercase tracking-widest">{record.day}</span>
+                          <div className="flex items-center gap-2 bg-white/10 px-2 py-0.5 rounded">
+                            <span className="font-mono text-[10px] opacity-70">Điểm:</span>
+                            <span className={cn(
+                              "font-mono text-xs font-bold",
+                              record.violations.reduce((sum, v) => sum + (v.count * (VIOLATION_POINTS[v.type] || 0)), 0) > 0 ? "text-red-400" : "text-green-400"
+                            )}>
+                              {safeToFixed(record.baseScore - record.violations.reduce((sum, v) => sum + (v.count * (VIOLATION_POINTS[v.type] || 0)), 0), 1)}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-4">
+                          <span className="font-mono text-[10px] opacity-70">Điểm gốc: {record.baseScore}</span>
+                          <div className="flex items-center gap-2">
+                             <span className="font-mono text-[10px] opacity-70">Sĩ số:</span>
+                             <input 
+                               type="number"
+                               min="0"
+                               value={record.studentCount || 0}
+                               onChange={(e) => updateDailyRecord(dIdx, 'studentCount', parseInt(e.target.value) || 0)}
+                               className="w-12 text-[12px] bg-transparent text-white border-b border-white/20 focus:outline-none text-center"
+                             />
+                          </div>
+                        </div>
+                      </div>
+                      <div className="p-4 space-y-3">
+                        {record.violations.length === 0 && (
+                          <p className="text-xs text-center py-4 opacity-40 italic">Không có lỗi vi phạm</p>
+                        )}
+                        {record.violations.map((v, vIdx) => (
+                          <div key={`${record.day}-${v.type}-${vIdx}`} className="grid grid-cols-12 gap-2 items-center border-b border-dashed border-[#141414]/20 pb-2">
+                            <select 
+                              value={v.type}
+                              onChange={(e) => updateViolation(dIdx, vIdx, 'type', e.target.value)}
+                              className="col-span-5 text-[12px] p-1 border border-[#141414] bg-white font-mono"
+                            >
+                              {Object.entries(VIOLATION_LABELS).map(([key, label]) => (
+                                <option key={key} value={key}>{label}</option>
+                              ))}
+                            </select>
+                            <input 
+                              type="text"
+                              value={v.description}
+                              placeholder="Mô tả..."
+                              onChange={(e) => updateViolation(dIdx, vIdx, 'description', e.target.value)}
+                              className="col-span-4 text-[12px] p-1 border border-[#141414] bg-white font-mono"
+                            />
+                            <input 
+                              type="number"
+                              value={v.count}
+                              min="1"
+                              onChange={(e) => updateViolation(dIdx, vIdx, 'count', parseInt(e.target.value) || 1)}
+                              className="col-span-2 text-[12px] p-1 border border-[#141414] bg-white font-mono text-center"
+                            />
+                            <button 
+                              onClick={() => removeViolation(dIdx, vIdx)}
+                              className="col-span-1 flex justify-center text-red-600 hover:scale-110 transition-transform"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          </div>
+                        ))}
+                        <div className="flex gap-2">
+                          <button 
+                            onClick={() => addViolation(dIdx)}
+                            className="flex-1 py-2 border border-dashed border-[#141414] text-[10px] uppercase font-mono flex items-center justify-center gap-1 hover:bg-gray-50 transition-colors"
+                          >
+                            <Plus className="w-3 h-3" /> Thêm lỗi
+                          </button>
+                          <div className="flex-1 flex gap-1">
+                            <button 
+                              onClick={() => startCamera(dIdx)}
+                              disabled={analyzingImageDay !== null}
+                              className="flex-1 py-2 border border-dashed border-green-700 text-green-700 text-[10px] uppercase font-mono flex items-center justify-center gap-1 hover:bg-green-50 transition-colors disabled:opacity-50"
+                              title="Chụp ảnh trực tiếp"
+                            >
+                              {analyzingImageDay === dIdx && analysisMethod === 'camera' ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Camera className="w-3 h-3" />} 
+                              {analyzingImageDay === dIdx && analysisMethod === 'camera' ? "..." : "Chụp"}
+                            </button>
+                            <button 
+                              onClick={() => {
+                                setAnalyzingImageDay(dIdx);
+                                setAnalysisMethod('upload');
+                                fileInputRef.current?.click();
+                              }}
+                              disabled={analyzingImageDay !== null}
+                              className="flex-1 py-2 border border-dashed border-blue-700 text-blue-700 text-[10px] uppercase font-mono flex items-center justify-center gap-1 hover:bg-blue-50 transition-colors disabled:opacity-50"
+                              title="Tải ảnh lên"
+                            >
+                              {analyzingImageDay === dIdx && analysisMethod === 'upload' ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Upload className="w-3 h-3" />} 
+                              {analyzingImageDay === dIdx && analysisMethod === 'upload' ? "..." : "Tải"}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Hidden File Input for Image Analysis */}
+                <input 
+                  type="file" 
+                  accept="image/*" 
+                  ref={fileInputRef} 
+                  onChange={handleImageUpload} 
+                  className="hidden" 
+                />
+
+                {/* Camera Modal */}
+                <AnimatePresence>
+                  {isCameraActive && (
+                    <motion.div 
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="fixed inset-0 z-[60] bg-black flex flex-col"
+                    >
+                      <div className="relative flex-1 flex items-center justify-center overflow-hidden">
+                        <video 
+                          ref={videoRef}
+                          autoPlay 
+                          playsInline 
+                          className="w-full h-full object-cover"
+                          onLoadedMetadata={() => videoRef.current?.play()}
+                        />
+                        <button 
+                          onClick={stopCamera}
+                          className="absolute top-4 right-4 w-10 h-10 bg-white/20 hover:bg-white/30 text-white rounded-full flex items-center justify-center backdrop-blur-md transition-colors"
+                        >
+                          <X className="w-6 h-6" />
+                        </button>
+                      </div>
+                      <div className="bg-[#141414] p-8 flex justify-center items-center gap-8">
+                        <button 
+                          onClick={stopCamera}
+                          className="w-12 h-12 border border-white/20 text-white rounded-full flex items-center justify-center hover:bg-white/10 transition-colors"
+                        >
+                          <X className="w-6 h-6" />
+                        </button>
+                        <button 
+                          onClick={capturePhoto}
+                          className="w-20 h-20 bg-white rounded-full flex items-center justify-center border-4 border-gray-400 active:scale-95 transition-transform"
+                        >
+                          <div className="w-16 h-16 border-2 border-[#141414] rounded-full" />
+                        </button>
+                        <div className="w-12 h-12" /> {/* Spacer */}
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
+                {/* Sidebar Inputs */}
+                <div className="space-y-6">
+                  <div className="bg-white border border-[#141414] p-6 space-y-6">
+                    <div>
+                      <h3 className="font-serif italic text-md mb-3">Điểm Sổ Đầu Bài</h3>
+                      <input 
+                        type="number"
+                        step="0.1"
+                        max="10"
+                        min="0"
+                        value={data.classLogScore}
+                        onChange={(e) => setData({...data, classLogScore: parseFloat(e.target.value) || 0})}
+                        className="w-full p-3 border border-[#141414] font-mono text-base"
+                      />
+                    </div>
+
+                    <div>
+                      <h3 className="font-serif italic text-md mb-3">Số lượng điểm 9, 10</h3>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={data.goodGradesCount}
+                        onChange={(e) => setData({...data, goodGradesCount: parseInt(e.target.value) || 0})}
+                        className="w-full p-2 border border-[#141414] font-mono text-sm"
+                      />
+                      <p className="text-[10px] mt-1 opacity-50 font-mono italic">Dùng để tính điểm thưởng (T)</p>
+                    </div>
+
+                    <div>
+                      <h3 className="font-serif italic text-md mb-3">Vi phạm cuối tuần</h3>
+                      <div className="space-y-2">
+                        <label className="flex items-center gap-3 cursor-pointer group">
+                          <input 
+                            type="checkbox"
+                            checked={data.weekendViolations.saturday}
+                            onChange={(e) => setData({...data, weekendViolations: {...data.weekendViolations, saturday: e.target.checked}})}
+                            className="w-4 h-4 accent-[#141414]"
+                          />
+                          <span className="font-mono text-xs uppercase tracking-tighter group-hover:underline">Thứ 7 có lỗi (-2đ)</span>
+                        </label>
+                        <label className="flex items-center gap-3 cursor-pointer group">
+                          <input 
+                            type="checkbox"
+                            checked={data.weekendViolations.sunday}
+                            onChange={(e) => setData({...data, weekendViolations: {...data.weekendViolations, sunday: e.target.checked}})}
+                            className="w-4 h-4 accent-[#141414]"
+                          />
+                          <span className="font-mono text-xs uppercase tracking-tighter group-hover:underline">Chủ nhật có lỗi (-2đ)</span>
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col md:flex-row gap-4">
+                    <button 
+                      onClick={() => setShowCheckModal(true)}
+                      className="flex-1 py-4 bg-white border border-[#141414] text-[#141414] font-mono text-xs uppercase tracking-widest shadow-[4px_4px_0px_0px_rgba(20,20,20,1)] hover:translate-x-1 hover:translate-y-1 hover:shadow-none transition-all flex items-center justify-center gap-2"
+                    >
+                      <ClipboardList className="w-4 h-4" /> Kiểm tra dữ liệu
+                    </button>
+                    <button 
+                      onClick={async () => {
+                        try {
+                          const officialId = `${selectedClass}_${selectedWeek}`;
+                          await setDoc(doc(db, 'official_data', officialId), {
+                            ...data,
+                            className: selectedClass,
+                            week: selectedWeek,
+                            status: 'approved',
+                            createdAt: new Date(),
+                            approvedAt: new Date()
+                          });
+                          
+                          // Also delete draft if it exists
+                          const draftId = `${userRole}_${selectedClass}_${selectedWeek}`;
+                          await deleteDoc(doc(db, 'drafts', draftId)).catch(() => {});
+                          
+                          alert('Dữ liệu đã được lưu chính thức!');
+                        } catch (e) {
+                          handleFirestoreError(e, 'create', 'official_data');
+                          alert('Có lỗi xảy ra khi lưu dữ liệu!');
+                        }
+                        setActiveTab('result');
+                        generateAiAnalysis(data);
+                      }}
+                      className="flex-1 py-4 bg-[#141414] text-[#E4E3E0] font-mono text-xs uppercase tracking-widest shadow-[4px_4px_0px_0px_rgba(0,0,0,0.2)] hover:translate-x-1 hover:translate-y-1 hover:shadow-none transition-all flex items-center justify-center gap-2"
+                    >
+                      <CheckCircle2 className="w-4 h-4" /> Lưu & Xem kết quả
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          ) : activeTab === 'ranking' ? (
+            <motion.div
+              key="ranking"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              className="space-y-8"
+            >
+              <h2 className="font-serif italic text-2xl mb-6">Bảng xếp hạng</h2>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                <div className="bg-white border border-[#141414] p-6 shadow-[4px_4px_0px_0px_rgba(20,20,20,1)]">
+                  <h3 className="font-bold mb-4 font-mono uppercase tracking-widest text-sm">Cấp THCS</h3>
+                  <table className="w-full text-sm font-mono mb-6">
+                    <thead>
+                      <tr className="border-b border-[#141414]">
+                        <th className="text-left py-2">Lớp</th>
+                        <th className="text-right py-2">Điểm</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rankingData.thcs.map((c, i) => (
+                        <tr key={`${c.name}-${i}`} className="border-b border-dashed border-[#141414]/20">
+                          <td className="py-2">{i + 1}. {c.name}</td>
+                          <td className="text-right py-2">{safeToFixed(c.score, 2)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <h4 className="font-bold mb-2 font-mono uppercase tracking-widest text-xs text-red-600">Ba lớp xếp cuối (THCS)</h4>
+                  <ul className="text-sm font-mono list-decimal pl-4">
+                    {rankingData.bottomThcs.map((c, i) => (
+                      <li key={`${c.name}-bottom-${i}`} className="py-1">{c.name} ({safeToFixed(c.score, 2)})</li>
+                    ))}
+                  </ul>
+                </div>
+                <div className="bg-white border border-[#141414] p-6 shadow-[4px_4px_0px_0px_rgba(20,20,20,1)]">
+                  <h3 className="font-bold mb-4 font-mono uppercase tracking-widest text-sm">Cấp THPT</h3>
+                  <table className="w-full text-sm font-mono mb-6">
+                    <thead>
+                      <tr className="border-b border-[#141414]">
+                        <th className="text-left py-2">Lớp</th>
+                        <th className="text-right py-2">Điểm</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rankingData.thpt.map((c, i) => (
+                        <tr key={`${c.name}-${i}`} className="border-b border-dashed border-[#141414]/20">
+                          <td className="py-2">{i + 1}. {c.name}</td>
+                          <td className="text-right py-2">{safeToFixed(c.score, 2)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <h4 className="font-bold mb-2 font-mono uppercase tracking-widest text-xs text-red-600">Hai lớp xếp cuối (THPT)</h4>
+                  <ul className="text-sm font-mono list-decimal pl-4">
+                    {rankingData.bottomThpt.map((c, i) => (
+                      <li key={`${c.name}-bottom-${i}`} className="py-1">{c.name} ({safeToFixed(c.score, 2)})</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            </motion.div>
+          ) : (
+            <motion.div 
+              key="result"
+              id="report-content"
+              ref={contentRef}
+              initial={{ opacity: 0, scale: 0.98 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.98 }}
+              className="space-y-8 print:space-y-6"
+            >
+              {(appData[selectedClass]?.[selectedWeek] || aiAnalysis) ? (
+                <>
+                  {/* Status Badge */}
+                  {appData[selectedClass]?.[selectedWeek] ? (
+                    <div className="bg-green-50 border border-green-200 p-4 mb-6 flex items-center gap-3">
+                      <CheckCircle2 className="w-5 h-5 text-green-600" />
+                      <p className="text-green-800 font-mono text-xs uppercase tracking-widest">
+                        DỮ LIỆU ĐÃ ĐƯỢC LƯU CHÍNH THỨC
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="bg-blue-50 border border-blue-200 p-4 mb-6 flex items-center gap-3">
+                      <Sparkles className="w-5 h-5 text-blue-600" />
+                      <p className="text-blue-800 font-mono text-xs uppercase tracking-widest">
+                        Chế độ xem trước kết quả
+                      </p>
+                    </div>
+                  )}
+                  {/* Print Header */}
+                  <div className="hidden print:block text-center mb-8">
+                    <h1 className="text-3xl font-serif italic font-bold">Báo Cáo Thi Đua Nội Trú</h1>
+                    <p className="text-lg font-mono mt-2">Lớp: {selectedClass} - Tuần: {selectedWeek}</p>
+                  </div>
+
+                  {/* Summary Cards */}
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                    <div className="bg-white border border-[#141414] p-4 flex flex-col items-center justify-center text-center">
+                      <span className="text-[10px] font-mono uppercase opacity-50 mb-1">Nề nếp (N)</span>
+                      <span className="text-3xl font-serif italic">{safeToFixed(calculateResults.N, 2)}</span>
+                    </div>
+                    <div className="bg-white border border-[#141414] p-4 flex flex-col items-center justify-center text-center">
+                      <span className="text-[10px] font-mono uppercase opacity-50 mb-1">Sổ đầu bài</span>
+                      <span className="text-3xl font-serif italic">{safeToFixed(data.classLogScore, 1)}</span>
+                    </div>
+                    <div className="bg-white border border-[#141414] p-4 flex flex-col items-center justify-center text-center">
+                      <span className="text-[10px] font-mono uppercase opacity-50 mb-1">Thưởng (T)</span>
+                      <span className="text-3xl font-serif italic">+{calculateResults.T}</span>
+                    </div>
+                    <div className="bg-[#141414] text-[#E4E3E0] border border-[#141414] p-4 flex flex-col items-center justify-center text-center shadow-[4px_4px_0px_0px_rgba(0,0,0,0.2)]">
+                      <span className="text-[10px] font-mono uppercase opacity-50 mb-1">Tổng điểm (S)</span>
+                      <span className="text-4xl font-serif italic font-bold">{safeToFixed(calculateResults.S, 2)}</span>
+                    </div>
+                  </div>
+
+                  {/* Detailed Table */}
+                  <section className="bg-white border border-[#141414] overflow-hidden">
+                    <div className="bg-[#141414] text-[#E4E3E0] px-6 py-3 flex items-center gap-2">
+                      <FileText className="w-4 h-4" />
+                      <h2 className="font-mono text-xs uppercase tracking-widest">Bảng tính chi tiết</h2>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left border-collapse">
+                        <thead>
+                          <tr className="border-b border-[#141414]">
+                            <th className="p-4 font-serif italic text-xs uppercase opacity-50">Hạng mục</th>
+                            <th className="p-4 font-serif italic text-xs uppercase opacity-50">Chi tiết</th>
+                            <th className="p-4 font-serif italic text-xs uppercase opacity-50 text-right">Điểm</th>
+                          </tr>
+                        </thead>
+                        <tbody className="font-mono text-xs">
+                          {data.dailyRecords.map((r, i) => (
+                            <tr key={r.day} className="border-b border-[#141414]/10 hover:bg-gray-50 transition-colors">
+                              <td className="p-4 font-bold">{r.day}</td>
+                              <td className="p-4">
+                                {r.violations.length > 0 
+                                  ? r.violations.map(v => {
+                                      let text = `${VIOLATION_LABELS[v.type]} x${v.count}`;
+                                      if (v.type === 'room' && (data.roomCount || 1) > 1) {
+                                        text += ` (chia ${data.roomCount} phòng)`;
+                                      }
+                                      return text;
+                                    }).join(', ')
+                                  : "Không vi phạm"}
+                              </td>
+                              <td className="p-4 text-right">{safeToFixed(calculateResults.dailyScores[i], 2)}</td>
+                            </tr>
+                          ))}
+                          <tr className="bg-[#F5F5F3]">
+                            <td className="p-4 font-bold">Điểm nề nếp trung bình (N)</td>
+                            <td className="p-4 italic opacity-60">(Tổng 5 ngày) / 5</td>
+                            <td className="p-4 text-right font-bold">{safeToFixed(calculateResults.N, 2)}</td>
+                          </tr>
+                          <tr>
+                            <td className="p-4 font-bold">Điểm Sổ đầu bài</td>
+                            <td className="p-4">Dữ liệu từ giáo viên</td>
+                            <td className="p-4 text-right">{safeToFixed(data.classLogScore, 1)}</td>
+                          </tr>
+                          <tr>
+                            <td className="p-4 font-bold">Điểm thưởng (T)</td>
+                            <td className="p-4">{data.goodGradesCount} điểm 9, 10</td>
+                            <td className="p-4 text-right">+{calculateResults.T}</td>
+                          </tr>
+                          <tr>
+                            <td className="p-4 font-bold">Trừ cuối tuần</td>
+                            <td className="p-4">
+                              {data.weekendViolations.saturday && "Thứ 7 (-2) "}
+                              {data.weekendViolations.sunday && "Chủ nhật (-2)"}
+                              {!data.weekendViolations.saturday && !data.weekendViolations.sunday && "Không vi phạm"}
+                            </td>
+                            <td className="p-4 text-right text-red-600">-{calculateResults.weekendDeduction}</td>
+                          </tr>
+                        </tbody>
+                        <tfoot>
+                          <tr className="bg-[#141414] text-[#E4E3E0]">
+                            <td colSpan={2} className="p-4 font-serif italic text-lg">Công thức: (0.45*N) + (0.45*SĐB) + (0.1*T) - L</td>
+                            <td className="p-4 text-right text-2xl font-serif italic font-bold">{safeToFixed(calculateResults.S, 2)}</td>
+                          </tr>
+                        </tfoot>
+                      </table>
+                    </div>
+                  </section>
+
+                  {/* Comparative Analysis & Trends */}
+                  <section className="bg-white border border-[#141414] overflow-hidden">
+                    <div className="bg-[#141414] text-[#E4E3E0] px-4 py-2 flex items-center gap-2">
+                      <TrendingUp className="w-4 h-4" />
+                      <h2 className="font-mono text-xs uppercase tracking-widest">Phân tích So sánh & Xu hướng hoạt động</h2>
+                    </div>
+                    
+                    <div className="grid grid-cols-1 md:grid-cols-3 border-b border-[#141414]">
+                      {/* Growth Metric */}
+                      <div className="p-6 border-r border-[#141414] last:border-r-0">
+                        <div className="text-[10px] font-mono uppercase opacity-50 mb-4">Chỉ số tăng trưởng (Tuần {selectedWeek-1} → {selectedWeek})</div>
+                        {comparativeAnalysis.w1Score !== null ? (
+                          <div className="space-y-2">
+                            <div className="flex items-baseline gap-2">
+                              <span className="text-4xl font-serif italic">{safeToFixed(calculateResults.S, 2)}</span>
+                              <span className={cn(
+                                "text-sm font-mono font-bold px-2 py-0.5 rounded",
+                                comparativeAnalysis.growth! >= 0 ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+                              )}>
+                                {comparativeAnalysis.growth! >= 0 ? '+' : ''}{safeToFixed(comparativeAnalysis.growth, 1)}%
+                              </span>
+                            </div>
+                            <div className="text-[10px] font-mono opacity-60">
+                              Điểm tuần trước: {safeToFixed(comparativeAnalysis.w1Score, 2)}
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="h-16 flex items-center text-sm font-mono italic opacity-40">Dữ liệu tuần trước chưa sẵn sàng</div>
+                        )}
+                      </div>
+
+                      {/* Score History Sparkline-like */}
+                      <div className="p-6 border-r border-[#141414] last:border-r-0 md:col-span-2">
+                        <div className="text-[10px] font-mono uppercase opacity-50 mb-4">Biểu đồ xu hướng điểm số (3 tuần gần nhất)</div>
+                        <div className="flex items-end gap-4 h-16">
+                          {comparativeAnalysis.last3WeeksScores.slice().reverse().map((score, idx) => (
+                            <div key={idx} className="flex-1 flex flex-col items-center gap-2">
+                              <div 
+                                className="w-full bg-[#141414] transition-all duration-500" 
+                                style={{ height: `${(score / 10) * 100}%`, minHeight: '4px' }}
+                              />
+                              <span className="text-[9px] font-mono opacity-60">{safeToFixed(score, 1)}</span>
+                            </div>
+                          ))}
+                          {comparativeAnalysis.last3WeeksScores.length < 3 && Array(3 - comparativeAnalysis.last3WeeksScores.length).fill(0).map((_, i) => (
+                            <div key={`empty-${i}`} className="flex-1 flex flex-col items-center gap-2">
+                              <div className="w-full h-1 bg-gray-100" />
+                              <span className="text-[9px] font-mono opacity-20">N/A</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="p-6 bg-[#F5F5F3]">
+                      <div className="text-[10px] font-mono uppercase opacity-50 mb-4">Phân tích lỗi vi phạm hệ thống</div>
+                      {comparativeAnalysis.mostFrequentViolation ? (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                          <div>
+                            <div className="flex items-center gap-3 mb-2">
+                              <div className="w-2 h-2 rounded-full bg-red-600 animate-pulse" />
+                              <span className="text-lg font-serif italic text-red-600 font-bold">{comparativeAnalysis.mostFrequentViolation}</span>
+                            </div>
+                            <p className="text-xs font-mono opacity-70 leading-relaxed">
+                              Đây là hạng mục vi phạm nhiều nhất với <span className="font-bold text-[#141414]">{comparativeAnalysis.maxCount} lần</span> ghi nhận trong 3 tuần qua. 
+                              Việc lặp lại lỗi này ảnh hưởng đáng kể đến điểm thi đua tổng thể của lớp.
+                            </p>
+                          </div>
+                          
+                          <div className="bg-white border border-[#141414]/10 p-4 shadow-sm">
+                            <div className="text-[10px] font-mono uppercase font-bold mb-2 text-amber-700 flex items-center gap-2">
+                              <Sparkles className="w-3 h-3" />
+                              Giải pháp khắc phục hệ thống:
+                            </div>
+                            <p className="text-xs font-serif leading-relaxed italic text-gray-700">
+                              "{EDUCATIONAL_SOLUTIONS[comparativeAnalysis.mostFrequentViolationType as keyof typeof EDUCATIONAL_SOLUTIONS]}"
+                            </p>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="text-sm font-mono italic opacity-40 py-4">Hệ thống đang thu thập thêm dữ liệu để phân tích xu hướng vi phạm...</div>
+                      )}
+                    </div>
+                  </section>
+
+                  {/* AI Analysis */}
+                  <section className="bg-white border border-[#141414] p-6 relative overflow-hidden">
+                    <div className="absolute top-0 right-0 p-2 opacity-5">
+                      <MessageSquare className="w-24 h-24" />
+                    </div>
+                    <div className="flex items-center gap-2 mb-4">
+                      <Sparkles className="w-4 h-4 text-amber-600" />
+                      <h2 className="font-serif italic text-lg">Nhận xét từ Trợ lý AI</h2>
+                    </div>
+                    <div className="prose prose-sm max-w-none font-serif text-[#333] leading-relaxed">
+                      {(aiAnalysis || data.aiAnalysis) ? (
+                        <ReactMarkdown>{aiAnalysis || data.aiAnalysis || ""}</ReactMarkdown>
+                      ) : (
+                        <div className="flex items-center gap-2 opacity-40 italic">
+                          <RefreshCw className="w-3 h-3 animate-spin" />
+                          <span>Đang tạo nhận xét...</span>
+                        </div>
+                      )}
+                    </div>
+                  </section>
+
+                  <div className="flex flex-wrap justify-center gap-4 print:hidden">
+                    <button 
+                      onClick={() => setShowMarkdown(true)}
+                      className="px-6 py-3 bg-white border border-[#141414] font-mono text-xs uppercase tracking-widest hover:bg-gray-50 transition-all flex items-center gap-2"
+                    >
+                      <Download className="w-4 h-4" /> Xuất Markdown
+                    </button>
+                    <button 
+                      onClick={handlePrint}
+                      className="px-6 py-3 bg-white border border-[#141414] font-mono text-xs uppercase tracking-widest hover:bg-gray-50 transition-all flex items-center gap-2"
+                    >
+                      <FileText className="w-4 h-4" /> In báo cáo (PDF)
+                    </button>
+                    <button 
+                      onClick={() => setActiveTab('input')}
+                      className="px-6 py-3 bg-[#141414] text-[#E4E3E0] font-mono text-xs uppercase tracking-widest hover:bg-[#333] transition-all flex items-center gap-2"
+                    >
+                      <Calculator className="w-4 h-4" /> Chỉnh sửa dữ liệu
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div className="text-center p-10 bg-gray-50 border border-gray-200">
+                  <p className="font-serif italic text-lg text-gray-500">Chưa có dữ liệu cho lớp {selectedClass} tuần {selectedWeek}.</p>
+                </div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Markdown Export Modal */}
+        <AnimatePresence>
+          {showCheckModal && (
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
+            >
+              <motion.div 
+                initial={{ scale: 0.95, y: 20 }}
+                animate={{ scale: 1, y: 0 }}
+                exit={{ scale: 0.95, y: 20 }}
+                className="bg-white border border-[#141414] w-full max-w-2xl shadow-2xl flex flex-col max-h-[90vh]"
+              >
+                <div className="flex justify-between items-center p-4 border-b border-[#141414] bg-[#141414] text-[#E4E3E0]">
+                  <h3 className="font-mono text-xs uppercase tracking-widest">Kiểm tra dữ liệu - Lớp {selectedClass} Tuần {selectedWeek}</h3>
+                  <button onClick={() => setShowCheckModal(false)} className="hover:text-white">✕</button>
+                </div>
+                <div className="p-6 flex-1 overflow-auto space-y-6">
+                  <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                    <div className="p-3 bg-gray-50 border border-gray-200 text-center">
+                      <p className="text-[10px] uppercase opacity-50 font-mono">Điểm N</p>
+                      <p className="text-xl font-serif italic">{safeToFixed(calculateResults.N, 2)}</p>
+                    </div>
+                    <div className="p-3 bg-gray-50 border border-gray-200 text-center">
+                      <p className="text-[10px] uppercase opacity-50 font-mono">Điểm SĐB</p>
+                      <p className="text-xl font-serif italic">{safeToFixed(data.classLogScore, 1)}</p>
+                    </div>
+                    <div className="p-3 bg-gray-50 border border-gray-200 text-center">
+                      <p className="text-[10px] uppercase opacity-50 font-mono">Điểm T</p>
+                      <p className="text-xl font-serif italic">+{calculateResults.T}</p>
+                    </div>
+                    <div className="p-3 bg-gray-50 border border-gray-200 text-center">
+                      <p className="text-[10px] uppercase opacity-50 font-mono">Trừ L</p>
+                      <p className="text-xl font-serif italic">-{calculateResults.weekendDeduction}</p>
+                    </div>
+                    <div className="p-3 bg-green-50 border border-green-200 text-center col-span-2 md:col-span-1">
+                      <p className="text-[10px] uppercase text-green-600 font-mono">Tổng S</p>
+                      <p className="text-xl font-serif italic text-green-700">{safeToFixed(calculateResults.S, 2)}</p>
+                    </div>
+                  </div>
+
+                  <div className="bg-[#141414] text-[#E4E3E0] p-3 text-[10px] font-mono italic text-center">
+                    Công thức: (0.45 * N) + (0.45 * SĐB) + (0.1 * T) - L
+                  </div>
+
+                  <div className="space-y-4">
+                    <h4 className="font-mono text-xs uppercase tracking-widest border-b border-gray-100 pb-2">Chi tiết vi phạm</h4>
+                    {data.dailyRecords.map((record, idx) => (
+                      <div key={idx} className="space-y-1">
+                        <div className="flex justify-between items-center">
+                          <p className="text-xs font-bold font-mono">{record.day}</p>
+                          <p className="text-xs font-mono opacity-50">Điểm: {safeToFixed(calculateResults.dailyScores[idx], 2)}</p>
+                        </div>
+                        {record.violations.length === 0 ? (
+                          <p className="text-[10px] italic opacity-40 pl-4">Không có vi phạm</p>
+                        ) : (
+                          <ul className="pl-4 space-y-1">
+                            {record.violations.map((v, vIdx) => (
+                              <li key={vIdx} className="text-[10px] font-mono flex justify-between">
+                                <span>• {VIOLATION_LABELS[v.type]} {v.description ? `(${v.description})` : ''}</span>
+                                <span className="font-bold">x{v.count}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="space-y-2">
+                    <h4 className="font-mono text-xs uppercase tracking-widest border-b border-gray-100 pb-2">Thông tin khác</h4>
+                    <div className="grid grid-cols-2 gap-4 text-[10px] font-mono">
+                      <p>Sổ đầu bài: <span className="font-bold">{data.classLogScore}</span></p>
+                      <p>Số điểm 10: <span className="font-bold">{data.goodGradesCount}</span></p>
+                      <p>Sĩ số: <span className="font-bold">{data.studentCount}</span></p>
+                      <p>Số phòng: <span className="font-bold">{data.roomCount}</span></p>
+                    </div>
+                  </div>
+                </div>
+                <div className="p-4 border-t border-[#141414] bg-gray-50 flex justify-end gap-3">
+                  <button 
+                    onClick={() => setShowCheckModal(false)}
+                    className="px-6 py-2 bg-white border border-[#141414] text-[#141414] font-mono text-xs uppercase tracking-widest hover:bg-gray-100 transition-colors"
+                  >
+                    Quay lại sửa
+                  </button>
+                  <button 
+                    onClick={async () => {
+                      try {
+                        const officialId = `${selectedClass}_${selectedWeek}`;
+                        await setDoc(doc(db, 'official_data', officialId), {
+                          ...data,
+                          className: selectedClass,
+                          week: selectedWeek,
+                          status: 'approved',
+                          createdAt: new Date(),
+                          approvedAt: new Date()
+                        });
+                        
+                        const draftId = `${userRole}_${selectedClass}_${selectedWeek}`;
+                        await deleteDoc(doc(db, 'drafts', draftId)).catch(() => {});
+                        
+                        alert('Dữ liệu đã được lưu chính thức!');
+                        setShowCheckModal(false);
+                        setActiveTab('result');
+                        generateAiAnalysis(data);
+                      } catch (e) {
+                        handleFirestoreError(e, 'create', 'official_data');
+                        alert('Có lỗi xảy ra khi lưu dữ liệu!');
+                      }
+                    }}
+                    className="px-6 py-2 bg-[#141414] text-[#E4E3E0] font-mono text-xs uppercase tracking-widest hover:bg-[#333] transition-colors"
+                  >
+                    Xác nhận & Lưu
+                  </button>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+
+          {showMarkdown && (
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
+            >
+              <motion.div 
+                initial={{ scale: 0.95, y: 20 }}
+                animate={{ scale: 1, y: 0 }}
+                exit={{ scale: 0.95, y: 20 }}
+                className="bg-white border border-[#141414] w-full max-w-2xl shadow-2xl flex flex-col max-h-[90vh]"
+              >
+                <div className="flex justify-between items-center p-4 border-b border-[#141414] bg-[#141414] text-[#E4E3E0]">
+                  <h3 className="font-mono text-xs uppercase tracking-widest">Xuất dữ liệu Markdown</h3>
+                  <button onClick={() => setShowMarkdown(false)} className="hover:text-white">✕</button>
+                </div>
+                <div className="p-4 flex-1 overflow-auto">
+                  <textarea 
+                    readOnly
+                    value={generateMarkdown()}
+                    className="w-full h-64 p-4 bg-[#F5F5F3] border border-[#141414] font-mono text-xs focus:outline-none resize-none"
+                  />
+                </div>
+                <div className="p-4 border-t border-[#141414] bg-gray-50 flex justify-end gap-2">
+                  <button 
+                    onClick={() => {
+                      navigator.clipboard.writeText(generateMarkdown());
+                      alert('Đã copy vào clipboard!');
+                    }}
+                    className="px-4 py-2 bg-[#141414] text-[#E4E3E0] font-mono text-xs uppercase tracking-widest hover:bg-[#333] transition-colors"
+                  >
+                    Copy Markdown
+                  </button>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </main>
+
+      <footer className="mt-20 border-t border-[#141414] p-12 text-center opacity-30 print:mt-8 print:p-4">
+        <p className="font-mono text-[10px] uppercase tracking-[0.2em]">Trường Phổ thông Dân tộc Nội trú • 2026</p>
+      </footer>
+    </div>
+  );
+}
